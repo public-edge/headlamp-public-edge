@@ -35,10 +35,21 @@ function Dashboard() {
   const [selectedHost, setSelectedHost] = useState('');
   const [edges, edgeError] = PublicEdge.useList({} as any);
   const [routes, routeError] = HTTPRoute.useList({} as any);
-  const [pods] = K8s.ResourceClasses.Pod.useList({} as any);
-  const [slices] = K8s.ResourceClasses.EndpointSlice.useList({} as any);
-  const [ingresses] = K8s.ResourceClasses.Ingress.useList({} as any);
-  const [services] = K8s.ResourceClasses.Service.useList({} as any);
+  const [pods, podError] = K8s.ResourceClasses.Pod.useList({} as any);
+  const [slices, sliceError] = K8s.ResourceClasses.EndpointSlice.useList({} as any);
+  const [ingresses, ingressError] = K8s.ResourceClasses.Ingress.useList({} as any);
+  const [services, serviceError] = K8s.ResourceClasses.Service.useList({} as any);
+  const [configMaps, configMapError] = K8s.ResourceClasses.ConfigMap.useList({} as any);
+  const qualityConfigMap=(configMaps || []).find((item:any)=>item.metadata?.namespace==='regional-routing' && item.metadata?.name==='public-edge-globalping-quality');
+  let quality:any={};
+  try { quality=JSON.parse(qualityConfigMap?.data?.['quality.json'] || '{}'); } catch { quality={parseError:'quality.json is invalid JSON'}; }
+  const qualityCandidates=Object.entries(quality.candidates || {}).map(([name,value]:any)=>({name,...value}));
+  const qualityServices=Object.entries(quality.services || {}).map(([name,value]:any)=>({name,...value}));
+  const apiErrors=[
+    ['PublicEdge',edgeError],['Gateway / HTTPRoute',routeError],['Pod',podError],
+    ['EndpointSlice',sliceError],['Ingress',ingressError],['Service',serviceError],
+    ['ConfigMap',configMapError],
+  ].filter(([,error])=>Boolean(error));
   const publicRoutes = (routes || []).filter((x:any)=>x.spec?.hostnames?.length);
   const podByIp = new Map((pods || []).filter((x:any)=>x.status?.podIP).map((x:any)=>[x.status.podIP,x]));
 
@@ -66,7 +77,7 @@ function Dashboard() {
     <Box sx={{display:'flex',alignItems:'center',gap:2,p:2.5,borderRadius:3,background:'linear-gradient(135deg, rgba(18,60,145,.12), rgba(19,156,255,.05) 65%, rgba(0,223,131,.10))',border:'1px solid rgba(18,60,145,.16)'}}>
       <PublicEdgeMark size={76}/><Box><Typography variant="h4" sx={{fontWeight:800,color:'#123c91'}}>Public Edge</Typography><Typography color="text.secondary">从外部 Endpoint 进入集群，查看 DNS authority、Gateway、Service、EndpointSlice 与 Pod 的查询和回应。</Typography></Box>
     </Box>
-    {(edgeError || routeError) && <Alert severity="error">无法读取 PublicEdge/Gateway API：{String(edgeError || routeError)}</Alert>}
+    {apiErrors.map(([resource,error]:any)=><Alert key={resource} severity="error" sx={{mt:1}}>无法读取 {resource} API：{String(error)}</Alert>)}
     <SectionBox title="External endpoint query">
       {routeRows.length ? <>
         <FormControl size="small" sx={{minWidth:320,maxWidth:'100%',mb:2}}><Select value={selectedHost} onChange={event=>setSelectedHost(event.target.value)} aria-label="External endpoint">
@@ -96,8 +107,33 @@ function Dashboard() {
         {header:'Public endpoint',accessorFn:(x:any)=>x?.spec?.endpoint?.value || '-'},
         {header:'Gateway VIP',accessorFn:(x:any)=>x?.spec?.gatewayVIP || '-'},
         {header:'Capacity',accessorFn:(x:any)=>x?.spec?.capacityMbps == null ? '-' : `${x.spec.capacityMbps} Mbps`},
+        {header:'GlobalPing',accessorFn:(x:any)=>{const q=x?.status?.externalQuality; return <StatusLabel status={q?.ready?'success':'error'}>{q ? `${q.ready?'Ready':'Problem'} · ${q.ping?.probes || 0} probes` : 'No data'}</StatusLabel>}},
+        {header:'Latency / loss',accessorFn:(x:any)=>{const q=x?.status?.externalQuality?.ping; return q ? `${q.latencyAvgMs ?? '-'} ms / ${q.lossMaxPercent ?? '-'}%` : '-'}},
         {header:'State',accessorFn:(x:any)=><StatusLabel status={condition(x,'Ready')?'success':'error'}>{x?.spec?.draining?'Draining':condition(x,'Ready')?'Ready':'Unavailable'}</StatusLabel>},
         {header:'Classes',accessorFn:(x:any)=><Box sx={{display:'flex',gap:.5,flexWrap:'wrap'}}>{(Array.isArray(x?.spec?.serviceClasses) ? x.spec.serviceClasses : []).map((v:string)=><Chip key={v} size="small" label={v}/>)}</Box>}
+      ] as any}/>
+    </SectionBox>
+    <SectionBox title={`GlobalPing quality (${quality.observedAt || 'not observed'})`}>
+      {quality.parseError && <Alert severity="error">{quality.parseError}</Alert>}
+      {!qualityConfigMap && !configMapError && <Alert severity="warning">尚未发现 public-edge-globalping-quality ConfigMap。</Alert>}
+      <Typography variant="subtitle2" sx={{mb:1}}>逐边缘 SNI / HTTP</Typography>
+      <Table data={qualityCandidates} columns={[
+        {header:'Candidate',accessorKey:'name'},
+        {header:'Address',accessorKey:'target'},
+        {header:'Overall',accessorFn:(x:any)=><StatusLabel status={x.ready?'success':'error'}>{x.ready?'Ready':'Problem'}</StatusLabel>},
+        {header:'ICMP probes',accessorFn:(x:any)=>`${x.ping?.finished ?? 0}/${x.ping?.probes ?? 0}`},
+        {header:'Avg / max',accessorFn:(x:any)=>`${x.ping?.latencyAvgMs ?? '-'} / ${x.ping?.latencyMaxMs ?? '-'} ms`},
+        {header:'Loss',accessorFn:(x:any)=>x.ping?.lossMaxPercent == null?'-':`${x.ping.lossMaxPercent}%`},
+        {header:'SNI services',accessorFn:(x:any)=>Object.entries(x.services || {}).map(([host,result]:any)=>`${host}: ${result.ready?'ready':'failed'} (${result.finished ?? 0}/${result.probes ?? 0})`).join(', ') || '-'},
+      ] as any}/>
+      <Typography variant="subtitle2" sx={{mt:2,mb:1}}>服务域名</Typography>
+      <Table data={qualityServices} columns={[
+        {header:'Hostname',accessorKey:'name'},
+        {header:'Path',accessorKey:'path'},
+        {header:'State',accessorFn:(x:any)=><StatusLabel status={x.ready?'success':'error'}>{x.ready?'Ready':'Problem'}</StatusLabel>},
+        {header:'Probes',accessorFn:(x:any)=>`${x.finished ?? 0}/${x.probes ?? 0}`},
+        {header:'Avg / max',accessorFn:(x:any)=>`${x.latencyAvgMs ?? '-'} / ${x.latencyMaxMs ?? '-'} ms`},
+        {header:'Resolved addresses',accessorFn:(x:any)=>[...new Set((x.samples || []).map((sample:any)=>sample.resolvedAddress).filter(Boolean))].join(', ') || '-'},
       ] as any}/>
     </SectionBox>
     <SectionBox title={`Published services (${routeRows.length})`}>
